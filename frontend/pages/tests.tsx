@@ -1,13 +1,12 @@
 // frontend/pages/tests.tsx
 import { useEffect, useState } from 'react';
 import { useRouter } from 'next/router';
-import { examinerGenerate } from '../lib/api';
+import { afterExam, examinerGenerate } from '../lib/api';
+import { getStoredProfile } from '../lib/studentProfile';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
-
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE || 'http://localhost:10000';
 
 type Question = {
     id: string;
@@ -37,6 +36,14 @@ function normalizeMathDelimiters(content: string): string {
         .replace(/\\\]/g, '$$');
 }
 
+function normalizeLevel(
+    level: unknown
+): 'beginner' | 'intermediate' | 'advanced' {
+    if (level === 'advanced' || level === 'intermediate' || level === 'beginner')
+        return level;
+    return 'beginner';
+}
+
 export default function TestsPage() {
     const [count, setCount] = useState(5);
     const [loading, setLoading] = useState(false);
@@ -51,27 +58,17 @@ export default function TestsPage() {
 
     useEffect(() => {
         let initialCount = 5;
-
-        try {
-            const raw = localStorage.getItem('studentio_profile');
-            if (raw) {
-                const p = JSON.parse(raw);
-                if (p?.level === 'advanced') {
-                    initialCount = 8;
-                }
-            }
-        } catch {
-            // если что-то пошло не так — пусть будет 5
+        const profile = getStoredProfile();
+        if (profile?.level === 'advanced') {
+            initialCount = 8;
         }
 
         setCount(initialCount);
-
-        // СРАЗУ тянем экзамен
-        generate();
+        generate(initialCount);
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
-    async function generate() {
+    async function generate(requestedCount: number = count) {
         setLoading(true);
         setQuestions([]);
         setRubric('');
@@ -81,18 +78,8 @@ export default function TestsPage() {
 
         try {
             // 1) достаем student_id из того же профиля, что заполняет Куратор
-            let student_id: string | null = null;
-            try {
-                const raw = localStorage.getItem('studentio_profile');
-                if (raw) {
-                    const p = JSON.parse(raw);
-                    if (p?.student_id) {
-                        student_id = p.student_id;
-                    }
-                }
-            } catch {
-                // игнорируем, student_id останется null
-            }
+            const profile = getStoredProfile();
+            const student_id = profile?.student_id || null;
 
             if (!student_id) {
                 // нет профиля → просим вернуться к Куратору
@@ -105,7 +92,7 @@ export default function TestsPage() {
             // 2) выстрел на бэк
             // backend сам: если есть prepared_exam → вернет его,
             // иначе сгенерит новый
-            const data = await examinerGenerate(count, student_id);
+            const data = await examinerGenerate(requestedCount, student_id);
 
             const qs: Question[] = data?.questions || [];
             setQuestions(qs);
@@ -152,39 +139,18 @@ export default function TestsPage() {
 
         try {
             // достаём профиль из localStorage (как на главной)
-            let student_id = 'default';
-            let level = 'beginner';
-            let topic = '';
+            const profile = getStoredProfile();
+            const student_id = profile?.student_id || 'default';
+            const level = normalizeLevel(profile?.level);
+            const topic = profile?.last_topic || '';
 
-            try {
-                const raw = localStorage.getItem('studentio_profile');
-                if (raw) {
-                    const p = JSON.parse(raw);
-                    if (p?.student_id) student_id = p.student_id;
-                    if (p?.level) level = p.level;
-                    if (p?.last_topic) topic = p.last_topic;
-                }
-            } catch {
-                // если профиль не прочитался — оставляем дефолты
-            }
-
-            const res = await fetch(`${API_BASE}/v1/agents/after_exam`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    student_id,
-                    level,
-                    topic,
-                    ok: score.ok,
-                    total: score.total,
-                }),
+            const data: AfterExamResponse = await afterExam({
+                student_id,
+                level,
+                topic,
+                ok: score.ok,
+                total: score.total,
             });
-
-            if (!res.ok) {
-                throw new Error(`after_exam failed: ${res.status}`);
-            }
-
-            const data: AfterExamResponse = await res.json();
             const autoRoute = data?.orchestrator?.auto_route;
 
             // можно, если захочешь, показать подсказку из instruction_message
@@ -230,7 +196,7 @@ export default function TestsPage() {
                         className="rounded-xl px-3 py-2 bg-white/10 outline-none focus:ring-2 focus:ring-white/15"
                     />
                     <button
-                        onClick={generate}
+                        onClick={() => generate()}
                         disabled={loading}
                         className="rounded-xl px-4 py-2 bg-white/15 border border-white/10 hover:bg-white/20 disabled:opacity-50"
                     >

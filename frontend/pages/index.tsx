@@ -5,22 +5,15 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
+import { API_BASE, curatorFromChat, type ChatMsg } from '../lib/api';
+import { saveStoredProfile } from '../lib/studentProfile';
 
 /** ===== Конфиг API (без новых файлов/прокси) =====
  * Укажи во фронтовом .env.local:
  *   NEXT_PUBLIC_API_BASE=https://<твой-backend>.onrender.com
  * Локально можно: http://localhost:10000
  */
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE || 'http://localhost:10000';
 const CHAT_ENDPOINT = `${API_BASE}/v1/chat/stream`; // SSE чат прямо на backend
-const CURATOR_FROM_CHAT_ENDPOINT = `${API_BASE}/v1/agents/curator/from_chat`; // оценка от Куратора
-
-type Role = 'system' | 'user' | 'assistant';
-
-type ChatMsg = {
-    role: Role;
-    content: string;
-};
 
 type PlanStepType = 'exam' | 'materials' | 'chat' | 'other';
 
@@ -269,29 +262,17 @@ export default function HomePage() {
             };
 
             await wakeBackend();
-            const res = await fetch(CURATOR_FROM_CHAT_ENDPOINT, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload),
-            });
-            if (!res.ok)
-                throw new Error(`curator/from_chat failed: ${res.status}`);
-            const data: CuratorFromChatResponse = await res.json();
+            const data: CuratorFromChatResponse = await curatorFromChat(payload);
 
             // Сохраним «срез профиля» в localStorage — его подберут /tests и /materials
-            localStorage.setItem(
-                'studentio_profile',
-                JSON.stringify({
-                    student_id: payload.student_id,
-                    level: data?.profile?.level || level,
-                    goals: data?.goals || '',
-                    topics: data?.profile?.topics?.length
-                        ? data.profile.topics
-                        : [topic],
-                    weaknesses: data?.profile?.weaknesses || [],
-                    last_topic: topic,
-                })
-            );
+            saveStoredProfile({
+                student_id: payload.student_id,
+                level: data?.profile?.level || level,
+                goals: data?.goals || '',
+                topics: data?.profile?.topics?.length ? data.profile.topics : [topic],
+                weaknesses: data?.profile?.weaknesses || [],
+                last_topic: topic,
+            });
 
             // Базовое резюме от куратора
             const baseSummary =
@@ -340,7 +321,7 @@ export default function HomePage() {
         } catch (e) {
             console.error(e);
             alert(
-                'Не удалось провести оценку. Проверь NEXT_PUBLIC_API_BASE, CORS (ALLOW_ORIGINS) и доступность backend /health.'
+                'Не удалось провести оценку. Проверь NEXT_PUBLIC_API_BASE, CORS (ALLOWED_ORIGINS) и доступность backend /health.'
             );
         } finally {
             setEvaluating(false);

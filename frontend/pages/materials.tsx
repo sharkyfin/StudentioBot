@@ -1,18 +1,10 @@
 import { useEffect, useState } from 'react';
 import { generateMaterials, listMaterials, Material } from '../lib/api';
+import { StoredProfile, getStoredProfile } from '../lib/studentProfile';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
-
-type StoredProfile = {
-    student_id?: string;
-    level?: string;
-    goals?: string;
-    topics?: string[];
-    weaknesses?: string[];
-    last_topic?: string;
-};
 
 export default function MaterialsPage() {
     const [studentId, setStudentId] = useState('default');
@@ -25,18 +17,11 @@ export default function MaterialsPage() {
 
     // 1) Забираем профиль из localStorage, чтобы знать student_id и последнюю тему
     useEffect(() => {
-        try {
-            const raw = localStorage.getItem('studentio_profile');
-            if (raw) {
-                const p: StoredProfile = JSON.parse(raw);
-                if (p?.student_id) {
-                    setStudentId(p.student_id);
-                }
-                setProfile(p);
-            }
-        } catch (e) {
-            console.warn('Failed to parse studentio_profile', e);
+        const storedProfile = getStoredProfile();
+        if (storedProfile?.student_id) {
+            setStudentId(storedProfile.student_id);
         }
+        setProfile(storedProfile);
     }, []);
 
     // 2) При изменении studentId подгружаем материалы из backend

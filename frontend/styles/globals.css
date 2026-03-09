@@ -27,14 +27,3 @@
 .card {
     @apply bg-card shadow-soft rounded-2xl border border-white/5;
 }
-
-.py-6 {
-    margin-top: 6rem;
-}
-
-.fixed {
-    padding-top: 40px;
-}
-.h-14 {
-    padding-top: 40px;
-}

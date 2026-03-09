@@ -2,11 +2,13 @@
 from __future__ import annotations
 import json
 import random
-import re
 from typing import List, Dict, Any, Optional
 
 from app.deps import settings
 from app.memory.vector_store_pg import get_last_curator_snapshot, retrieve_memory
+from app.common.normalization import clamp_int
+from app.common.profile_snapshot import extract_profile_from_snapshot
+from app.common.questions import sanitize_question
 from openai import OpenAI
 from openai import RateLimitError, AuthenticationError, APIConnectionError, APIStatusError
 
@@ -17,27 +19,6 @@ def _llm() -> Optional[OpenAI]:
         return OpenAI(api_key=settings.OPENAI_API_KEY)
     except Exception:
         return None
-
-def _sanitize_question(q: Dict[str, Any], idx: int) -> Dict[str, Any]:
-    # приводим к строгому формату
-    text = str(q.get("text") or "").strip()
-    opts = q.get("options") or []
-    if not isinstance(opts, list):
-        opts = []
-    # гарантируем 4 опции
-    opts = [str(x) for x in opts if str(x).strip()][:4]
-    while len(opts) < 4:
-        opts.append(f"Вариант {len(opts)+1}")
-    try:
-        ans = int(q.get("answer")) if q.get("answer") is not None else 0
-    except Exception:
-        ans = 0
-    if not (0 <= ans < 4):
-        ans = 0
-    qid = str(q.get("id") or f"q{idx+1}")
-    if not text:
-        text = f"(fallback) Вопрос {idx+1}: выбери корректный вариант."
-    return {"id": qid, "text": text, "options": opts, "answer": ans}
 
 def _fallback_questions(topics: List[str], weaknesses: List[str], count: int) -> List[Dict[str, Any]]:
     """
@@ -106,44 +87,9 @@ def _fallback_questions(topics: List[str], weaknesses: List[str], count: int) ->
 
     qs: List[Dict[str, Any]] = []
     for i in range(count):
-        qs.append(_sanitize_question(pool[i % len(pool)], i))
+        qs.append(sanitize_question(pool[i % len(pool)], i))
 
     return qs
-
-
-def _extract_from_snapshot(s: Dict[str, Any]) -> Dict[str, Any]:
-    """Пытаемся вытащить topics/weaknesses из meta или из текста."""
-    topics: List[str] = []
-    weaknesses: List[str] = []
-    level = "beginner"
-
-    meta = s.get("meta") or {}
-    if isinstance(meta, dict):
-        level = meta.get("level", level)
-        if isinstance(meta.get("topics"), list):
-            topics = [str(x) for x in meta["topics"] if str(x).strip()]
-        if isinstance(meta.get("errors"), list):
-            weaknesses = [str(x) for x in meta["errors"] if str(x).strip()]
-
-    if not topics or not weaknesses:
-        text = s.get("text") or ""
-        # примитивный парсинг JSON внутри текста, если он есть
-        m = re.search(r'profile:\s*(\{.*\})', text, re.IGNORECASE | re.DOTALL)
-        if m:
-            try:
-                prof = json.loads(m.group(1))
-                if not topics:
-                    topics = [str(x) for x in prof.get("topics", []) if str(x).strip()]
-                if not weaknesses:
-                    weaknesses = [str(x) for x in prof.get("weaknesses", []) if str(x).strip()]
-                if "level" in prof:
-                    level = prof.get("level") or level
-            except Exception:
-                pass
-    # нормализуем
-    topics = topics[:5] if topics else []
-    weaknesses = weaknesses[:5] if weaknesses else []
-    return {"level": level, "topics": topics, "weaknesses": weaknesses}
 
 def _llm_generate_questions(
     client: OpenAI,
@@ -203,7 +149,7 @@ def _llm_generate_questions(
     user_msg = (
         "Вот данные о студенте и его контексте:\n"
         f"{json.dumps(payload, ensure_ascii=False, indent=2)}\n\n"
-        "Сгенерируй ровно {count} вопросов.\n"
+        f"Сгенерируй ровно {count} вопросов.\n"
         "Все вопросы должны быть содержательно связаны с этими темами/слабыми местами."
         f"{memory_block}"
     )
@@ -244,7 +190,7 @@ def _llm_generate_questions(
 
     for i, q in enumerate(raw_questions):
         if isinstance(q, dict):
-            out.append(_sanitize_question(q, i))
+            out.append(sanitize_question(q, i))
 
     # если LLM дал меньше, чем нужно — добиваем фолбэком
     if len(out) < count:
@@ -263,14 +209,13 @@ def generate_exam(count: int = 5, student_id: str = "default") -> Dict[str, Any]
     3) Пытается сгенерировать вопросы через LLM с учётом памяти.
     4) При любой ошибке — детерминированный fallback (не пустой).
     """
+    count = clamp_int(count, default=5, min_value=1, max_value=20)
+
     # --- 1. Срез куратора ---
     snap = get_last_curator_snapshot(student_id)
-    topics: List[str] = []
-    weaknesses: List[str] = []
-    if snap:
-        ex = _extract_from_snapshot(snap)
-        topics = ex["topics"]
-        weaknesses = ex["weaknesses"]
+    ex = extract_profile_from_snapshot(snap)
+    topics = ex["topics"]
+    weaknesses = ex["weaknesses"]
 
     # Если вообще нет данных — дадим хотя бы базовую тему
     if not topics and not weaknesses:

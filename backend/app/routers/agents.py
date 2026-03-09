@@ -6,11 +6,12 @@ import re
 from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.deps import settings
-from app.agents import curator, examiner, materials_agent, orchestrator, materials_llm_agent  # ← добавлен materials_agent и orchestrator
-
+from app.agents import curator, examiner, materials_agent, orchestrator
+from app.common.normalization import clamp_int
+from app.common.questions import sanitize_questions
 from app.memory.vector_store_pg import save_memory
 
 
@@ -42,13 +43,13 @@ class PlanStep(BaseModel):
     type: Literal["exam", "materials", "chat", "other"]
     title: str
     description: str
-    meta: Dict[str, Any] = {}
+    meta: Dict[str, Any] = Field(default_factory=dict)
     status: Literal["prepared", "pending", "error"] = "pending"
 
 
 class OrchestratorBlock(BaseModel):
     instruction_message: str
-    plan_steps: List[PlanStep] = []
+    plan_steps: List[PlanStep] = Field(default_factory=list)
 
     # Какому агенту «передать ход» дальше:
     # - examiner  → страница с тестами
@@ -133,17 +134,12 @@ def _save_chat_snapshot(student_id: str, topic: str, messages: list[dict]) -> No
     save_memory(student_id, text, meta)
 
 
-def _normalize_level(v: str) -> str:
-    v = (v or "").strip().lower()
-    if v in {"beginner", "intermediate", "advanced"}:
-        return v
-    if "нач" in v:
-        return "beginner"
-    if "сред" in v:
-        return "intermediate"
-    if "прод" in v:
-        return "advanced"
-    return "beginner"
+def _safe_student_id(value: str) -> str:
+    return (value or "").strip() or "default"
+
+
+def _serialize_chat_messages(messages: List[ChatMsg], limit: int = 30) -> List[Dict[str, str]]:
+    return [{"role": message.role, "content": message.content} for message in messages[-limit:]]
 
 
 def _heuristic_extract(messages: List[ChatMsg], topic_hint: str) -> tuple[str, List[str]]:
@@ -212,27 +208,6 @@ def _llm_extract(messages: List[ChatMsg], topic_hint: str) -> Optional[tuple[str
         return None
 
 
-def _sanitize_questions(questions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    for i, q in enumerate(questions or []):
-        text = str(q.get("text") or "").strip() or f"(fallback) Вопрос {i+1}"
-        opts = q.get("options") or []
-        if not isinstance(opts, list):
-            opts = []
-        opts = [str(x).strip() for x in opts if str(x).strip()][:4]
-        while len(opts) < 4:
-            opts.append(f"Вариант {len(opts)+1}")
-        ans = q.get("answer")
-        try:
-            ans = int(ans) if ans is not None else 0
-        except Exception:
-            ans = 0
-        if not (0 <= ans < 4):
-            ans = 0
-        out.append({"id": q.get("id") or f"q{i+1}", "text": text, "options": opts, "answer": ans})
-    return out
-
-
 # ====== РОУТЫ ======
 
 @router.post("/curator/from_chat", response_model=CuratorFromChatResponse)
@@ -246,15 +221,14 @@ async def curator_from_chat(req: CuratorFromChatRequest):
     # шаг 1: goals/errors
     extracted = _llm_extract(req.messages, req.topic) or _heuristic_extract(req.messages, req.topic)
     goals, errors = extracted
+    student_id = _safe_student_id(req.student_id)
+    safe_count = clamp_int(req.count, default=5, min_value=1, max_value=20)
 
     # готовим сырые сообщения для оркестратора И для сохранения в память
-    chat_messages_for_orchestrator = [
-        {"role": m.role, "content": m.content}
-        for m in req.messages[-30:]
-    ]
+    chat_messages_for_orchestrator = _serialize_chat_messages(req.messages)
 
     _save_chat_snapshot(
-        student_id=req.student_id or "default",
+        student_id=student_id,
         topic=req.topic or goals or "",
         messages=chat_messages_for_orchestrator,
     )
@@ -267,24 +241,18 @@ async def curator_from_chat(req: CuratorFromChatRequest):
         goals=goals,
         errors=errors,
         level=req.level,
-        student_id=req.student_id,
+        student_id=student_id,
     )
 
     # профайл для оркестратора — добавляем goals внутрь
     profile_for_orchestrator = dict(profile)
     profile_for_orchestrator.setdefault("goals", [goals] if goals else [])
 
-    # готовим сырые сообщения для оркестратора
-    chat_messages_for_orchestrator = [
-        {"role": m.role, "content": m.content}
-        for m in req.messages[-30:]  # последние 30 сообщений диалога
-    ]
-
     # шаг 3: строим план и дергаем под-агентов
     orchestrator_block = None
     try:
         orchestrator_block = await orchestrator.plan_and_execute(
-            student_id=req.student_id,
+            student_id=student_id,
             profile=profile_for_orchestrator,
             chat_messages=chat_messages_for_orchestrator,
         )
@@ -304,8 +272,8 @@ async def curator_from_chat(req: CuratorFromChatRequest):
 
     # шаг 4: при необходимости сразу делаем экзамен и возвращаем его в ответе
     if req.make_exam:
-        data = examiner.generate_exam(count=max(1, min(20, req.count)), student_id=req.student_id)
-        data["questions"] = _sanitize_questions(data.get("questions", []))
+        data = examiner.generate_exam(count=safe_count, student_id=student_id)
+        data["questions"] = sanitize_questions(data.get("questions", []))
         resp["exam"] = data
 
     return resp
@@ -322,9 +290,12 @@ async def examiner_route(req: ExaminerReq):
     то сначала пытаемся отдать его (и только если его нет — генерируем новый).
     """
     # сначала пробуем взять предгенерированный экзамен
+    student_id = _safe_student_id(req.student_id)
+    safe_count = clamp_int(req.count, default=5, min_value=1, max_value=20)
+
     prepared = None
     try:
-        prepared = examiner.pop_prepared_exam(req.student_id)  # type: ignore[attr-defined]
+        prepared = examiner.pop_prepared_exam(student_id)  # type: ignore[attr-defined]
     except Exception as e:
         print(f"[agents.examiner_route] pop_prepared_exam failed: {e}")
         prepared = None
@@ -332,9 +303,9 @@ async def examiner_route(req: ExaminerReq):
     if prepared is not None:
         data = prepared
     else:
-        data = examiner.generate_exam(count=max(1, min(20, req.count)), student_id=req.student_id)
+        data = examiner.generate_exam(count=safe_count, student_id=student_id)
 
-    questions = _sanitize_questions(data.get("questions", []))
+    questions = sanitize_questions(data.get("questions", []))
     return {
         "ok": True,
         "questions": questions,
@@ -361,6 +332,7 @@ async def after_exam(req: AfterExamRequest):
     По результату теста обновляем профиль и снова дергаем Orchestrator,
     чтобы он решил, что делать дальше: материалы, новый тест или куратор.
     """
+    student_id = _safe_student_id(req.student_id)
     # очень простой мэппинг результата → "ошибки" для куратора
     ratio = req.ok / max(1, req.total)
     errors: List[str] = []
@@ -379,12 +351,12 @@ async def after_exam(req: AfterExamRequest):
         goals=goals,
         errors=errors,
         level=req.level,
-        student_id=req.student_id,
+        student_id=student_id,
     )
 
     # снова запускаем оркестратор: пусть он решает, что дальше
     orch_block = await orchestrator.plan_and_execute(
-        student_id=req.student_id,
+        student_id=student_id,
         profile=profile,
     )
 
@@ -408,24 +380,36 @@ def generate_materials(req: MaterialsRequest):
     Генерирует/обновляет материалы для студента
     и возвращает ещё meta от MaterialsAgent (комментарий + рекомендации).
     """
-    student_id = req.student_id or "default"
+    student_id = _safe_student_id(req.student_id)
 
     # Профиль достаём так же, как внутри materials_agent,
     # чтобы MaterialsAgent понимал темы/слабые места.
     try:
-        profile = materials_agent._extract_profile(student_id)  # type: ignore[attr-defined]
+        profile = materials_agent.extract_profile(student_id)
     except Exception as e:
-        print(f"[agents.generate_materials] _extract_profile failed: {e}")
+        print(f"[agents.generate_materials] extract_profile failed: {e}")
         profile = {"level": "beginner", "topics": [], "weaknesses": []}
 
-    # Запускаем умного MaterialsAgent (через LangChain или фолбэк)
-    meta = materials_llm_agent.run_materials_agent(
-        student_id=student_id,
-        profile=profile,
-    )
+    generated = materials_agent.generate_and_save_materials(student_id)
 
     # Берём актуальные материалы из БД
     materials = materials_agent.get_materials_for_student(student_id)
+    topics = profile.get("topics") or []
+    weaknesses = profile.get("weaknesses") or []
+
+    meta: Dict[str, Any] = {
+        "status": "ok",
+        "comment": (
+            f"Материалы обновлены: {len(generated)} новых, всего доступно {len(materials)}."
+        ),
+        "study_suggestions": [
+            "1) Начни с конспекта и восстанови базовую модель темы.",
+            "2) Затем пройди шпаргалку и сверяйся с типичными ошибками.",
+            "3) После этого переходи к тестам для закрепления.",
+        ],
+        "focus_topics": topics[:5] if isinstance(topics, list) else [],
+        "weaknesses": weaknesses[:5] if isinstance(weaknesses, list) else [],
+    }
 
     return {"ok": True, "materials": materials, "meta": meta}
 
@@ -433,4 +417,4 @@ def generate_materials(req: MaterialsRequest):
 @router.get("/materials")
 def get_materials(student_id: str = "default"):
     """Возвращает материалы для студента."""
-    return materials_agent.get_materials_for_student(student_id)
+    return materials_agent.get_materials_for_student(_safe_student_id(student_id))

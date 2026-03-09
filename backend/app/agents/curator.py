@@ -1,204 +1,205 @@
-# app/agents/curator.py
+from __future__ import annotations
+
 import json
-from typing import List
+from typing import Any, Dict, List, Optional
 
-from openai import OpenAI
-from openai import RateLimitError, AuthenticationError, APIConnectionError, APIStatusError
+from openai import (
+    APIConnectionError,
+    APIStatusError,
+    AuthenticationError,
+    OpenAI,
+    RateLimitError,
+)
 
+from app.common.normalization import normalize_level
 from app.deps import settings
-from app.routers.legacy_api import _DB_STUDENT, StudentProfile
 from app.memory.vector_store_pg import retrieve_memory, save_memory
+from app.routers import legacy_api
 
-client = OpenAI(api_key=settings.OPENAI_API_KEY)
 
-
-def _normalize_level(value: str) -> str:
-    v = (value or "").strip().lower()
-    if v in {"beginner", "intermediate", "advanced"}:
-        return v
-    if "нач" in v:
-        return "beginner"
-    if "сред" in v:
-        return "intermediate"
-    if "прод" in v:
-        return "advanced"
-    return "beginner"
+def _llm_client() -> Optional[OpenAI]:
+    if not settings.OPENAI_API_KEY:
+        return None
+    try:
+        return OpenAI(api_key=settings.OPENAI_API_KEY)
+    except Exception:
+        return None
 
 
 def _basic_advice(errors: List[str], level: str, topic_hint: str = "") -> str:
-    """Короткая шпаргалка на случай, если LLM недоступен/исчерпана квота."""
-    lvl = _normalize_level(level)
-    parts = []
+    lvl = normalize_level(level)
+    parts: List[str] = []
+
     if topic_hint:
         parts.append(f"Тема: {topic_hint}")
     if errors:
         parts.append("Типичные ошибки: " + ", ".join(errors))
 
-    tips = []
-    low = [e.lower() for e in errors]
-    if any("знак" in e for e in low):
-        tips.append("Следи за знаками при переносах и раскрытии скобок.")
-    if any("скоб" in e for e in low):
-        tips.append("Аккуратно раскрывай скобки: a(b+c)=ab+ac; «минус» перед скобками меняет знаки внутри.")
-    if any("формул" in e for e in low):
-        tips.append("Собери мини-табличку формул именно для этой темы и пробеги перед решением.")
-    if any("логик" in e for e in low):
-        tips.append("В логике проверь приоритет операций и расставь скобки; сделай 2–3 контрольных примера.")
+    tips: List[str] = []
+    lowered = [error.lower() for error in errors]
+
+    if any("знак" in item for item in lowered):
+        tips.append("Проверяй знаки после каждого преобразования.")
+    if any("скоб" in item for item in lowered):
+        tips.append("Раскрывай скобки строго по шагам и перепроверяй итог.")
+    if any("формул" in item for item in lowered):
+        tips.append("Составь короткую памятку формул по теме перед практикой.")
 
     if lvl == "beginner":
-        tips.append("Разбивай задачу на шаги и решай 1–2 простых примера на каждый шаг.")
+        tips.append("Решай задачу маленькими шагами и фиксируй каждый переход.")
     elif lvl == "intermediate":
-        tips.append("Пробуй сначала без шпаргалки, затем сравни и зафиксируй «узкие» места.")
+        tips.append("Сначала решай без подсказок, затем сверяй с эталоном.")
     else:
-        tips.append("Иди от формального определения к задаче и обратно, проверяя крайние случаи.")
+        tips.append("Проверяй крайние случаи и формальные допущения решения.")
 
     if tips:
         parts.append("Советы:\n- " + "\n- ".join(tips))
-    return "\n".join(parts) if parts else "Повтори определения, выпиши ключевые формулы и реши 2–3 базовых примера."
+
+    return "\n".join(parts) if parts else "Повтори определения и реши 2-3 базовых примера."
 
 
-async def assess_student(goals: str, errors: list[str], level: str, student_id: str = "default") -> dict:
-    """
-    Анализирует данные ученика и обновляет его профиль, используя контекст из памяти.
-    - Тянет похожие записи из памяти (pgvector/trigram/last-resort — внутри vector_store_pg есть фолбэки).
-    - Пытается получить структурный профиль через LLM.
-    - При ошибке OpenAI (в т.ч. 429 insufficient_quota) — возвращает фолбэк-профиль.
-    - Всегда сохраняет «срез» в память и обновляет in-memory профиль (_DB_STUDENT).
-    """
-    lvl = _normalize_level(level)
-    errs = [str(e).strip() for e in (errors or []) if str(e).strip()]
-    goals = (goals or "").strip()
+def _fallback_profile(*, goals: str, errors: List[str], level: str, note: str) -> Dict[str, Any]:
+    normalized_level = normalize_level(level)
+    return {
+        "level": normalized_level,
+        "strengths": [],
+        "weaknesses": errors or ["ошибки не указаны"],
+        "topics": [goals] if goals else ["основы предмета"],
+        "notes": note,
+        "advice": _basic_advice(errors, normalized_level, goals),
+    }
 
-    # 1) достаём похожие прошлые данные из памяти (без срывов при отсутствии эмбеддингов)
+
+def _build_prompt(*, goals: str, errors: List[str], level: str, memory_text: str) -> str:
+    return (
+        "Ты учебный куратор. Проанализируй профиль студента и верни только JSON вида:\n"
+        "{\n"
+        '  "profile": {\n'
+        '    "level": "beginner|intermediate|advanced",\n'
+        '    "strengths": ["..."],\n'
+        '    "weaknesses": ["..."],\n'
+        '    "topics": ["..."],\n'
+        '    "notes": "...",\n'
+        '    "advice": "..."\n'
+        "  }\n"
+        "}\n\n"
+        f"Память студента:\n{memory_text}\n\n"
+        f"Цели: {goals or '—'}\n"
+        f"Ошибки: {', '.join(errors) if errors else '—'}\n"
+        f"Уровень: {level}\n"
+    )
+
+
+async def assess_student(
+    goals: str,
+    errors: list[str],
+    level: str,
+    student_id: str = "default",
+) -> dict:
+    normalized_level = normalize_level(level)
+    clean_errors = [str(error).strip() for error in (errors or []) if str(error).strip()]
+    clean_goals = (goals or "").strip()
+
     try:
-        memory_contexts = retrieve_memory(" ".join(errs + [goals]) or "общая тема", k=3, student_id=student_id)
-    except Exception as e:
-        print(f"[curator] retrieve_memory failed: {e}")
-        memory_contexts = []
-    memory_text = "\n".join(memory_contexts) if memory_contexts else "нет предыдущих данных."
+        memory_context = retrieve_memory(
+            " ".join(clean_errors + [clean_goals]) or "общая тема",
+            k=3,
+            student_id=student_id,
+        )
+    except Exception:
+        memory_context = []
 
-    # 2) готовим промпт для LLM
-    prompt = f"""
-Ты — Куратор. На основе данных оцени профиль ученика.
-Учитывай прошлый опыт обучения:
-{memory_text}
+    memory_text = "\n".join(memory_context) if memory_context else "нет предыдущих данных"
 
-Текущие данные:
-Цели: {goals or "—"}
-Ошибки: {', '.join(errs) if errs else "—"}
-Самооценка уровня: {lvl}
+    profile_data: Dict[str, Any]
+    client = _llm_client()
 
-Ответ строго в JSON:
-{{
-  "profile": {{
-     "level": "beginner|intermediate|advanced",
-     "strengths": ["..."],
-     "weaknesses": ["..."],
-     "topics": ["..."],
-     "notes": "...",
-     "advice": "короткая шпаргалка по исправлению типичных ошибок"
-  }}
-}}
-"""
-
-    profile_data: dict
-    # 3) пробуем LLM; ловим типовые ошибки квоты/сети/JSON-парсинга
-    if settings.OPENAI_API_KEY:
-        raw_content = ""  # сюда сохраним сырой ответ модели
+    if client is None:
+        profile_data = _fallback_profile(
+            goals=clean_goals,
+            errors=clean_errors,
+            level=normalized_level,
+            note="OPENAI_API_KEY не задан — использован детерминированный профиль.",
+        )
+    else:
+        prompt = _build_prompt(
+            goals=clean_goals,
+            errors=clean_errors,
+            level=normalized_level,
+            memory_text=memory_text,
+        )
         try:
             chat = client.chat.completions.create(
                 model=settings.OPENAI_MODEL,
-                temperature=0.4,
+                temperature=0.2,
                 response_format={"type": "json_object"},
                 messages=[
                     {
                         "role": "system",
-                        "content": "Ты опытный учебный куратор. Отвечай строго в JSON.",
+                        "content": "Ты опытный учебный куратор. Отвечай строго JSON.",
                     },
                     {"role": "user", "content": prompt},
                 ],
             )
-            raw_content = chat.choices[0].message.content or ""
-            # ЛОГИРУЕМ СЫРОЙ ОТВЕТ ВСЕГДА (можно оставить только на время отладки)
-            print(f"[curator] RAW LLM OUTPUT: {repr(raw_content)}")
 
-            # Пытаемся разобрать как JSON
-            data = json.loads(raw_content)
-            profile_data = data.get("profile", {})
-            # подстрахуем поля
-            profile_data.setdefault("level", lvl)
-            profile_data.setdefault("strengths", [])
-            profile_data.setdefault("weaknesses", errs or ["ошибки не указаны"])
-            profile_data.setdefault("topics", [goals] if goals else ["основы предмета"])
-            profile_data.setdefault("notes", "")
-            profile_data.setdefault("advice", _basic_advice(errs, lvl, goals))
+            content = chat.choices[0].message.content or "{}"
+            parsed = json.loads(content)
+            raw_profile = parsed.get("profile") or {}
 
-        except (RateLimitError, AuthenticationError, APIConnectionError, APIStatusError) as e:
-            print(f"[curator] LLM API error: {e}")
             profile_data = {
-                "level": lvl,
-                "strengths": [],
-                "weaknesses": errs or ["ошибки не указаны"],
-                "topics": [goals] if goals else ["основы предмета"],
-                "notes": "LLM недоступен (квота/сеть). Применена эвристика.",
-                "advice": _basic_advice(errs, lvl, goals),
+                "level": normalize_level(str(raw_profile.get("level") or normalized_level)),
+                "strengths": [str(x) for x in (raw_profile.get("strengths") or []) if str(x).strip()],
+                "weaknesses": [str(x) for x in (raw_profile.get("weaknesses") or clean_errors) if str(x).strip()]
+                or ["ошибки не указаны"],
+                "topics": [str(x) for x in (raw_profile.get("topics") or ([clean_goals] if clean_goals else [])) if str(x).strip()]
+                or ["основы предмета"],
+                "notes": str(raw_profile.get("notes") or ""),
+                "advice": str(raw_profile.get("advice") or _basic_advice(clean_errors, normalized_level, clean_goals)),
             }
-        except Exception as e:
-            # ТУТ ТЕПЕРЬ ВИДНО И ОШИБКУ, И СЫРОЙ ТЕКСТ
-            print(f"[curator] LLM parse error: {e}. RAW={repr(raw_content)}")
-            profile_data = {
-                "level": lvl,
-                "strengths": [],
-                "weaknesses": errs or ["ошибки не указаны"],
-                "topics": [goals] if goals else ["основы предмета"],
-                "notes": "(fallback) ошибка разбора JSON",
-                "advice": _basic_advice(errs, lvl, goals),
-            }
+        except (RateLimitError, AuthenticationError, APIConnectionError, APIStatusError):
+            profile_data = _fallback_profile(
+                goals=clean_goals,
+                errors=clean_errors,
+                level=normalized_level,
+                note="LLM недоступен (квота/сеть) — использован детерминированный профиль.",
+            )
+        except Exception:
+            profile_data = _fallback_profile(
+                goals=clean_goals,
+                errors=clean_errors,
+                level=normalized_level,
+                note="Не удалось разобрать ответ LLM — использован детерминированный профиль.",
+            )
 
-    else:
-        # без ключа — сразу эвристика
-        profile_data = {
-            "level": lvl,
-            "strengths": [],
-            "weaknesses": errs or ["ошибки не указаны"],
-            "topics": [goals] if goals else ["основы предмета"],
-            "notes": "OPENAI_API_KEY не задан — ответ без LLM.",
-            "advice": _basic_advice(errs, lvl, goals),
-        }
-
-    # 4) сохраняем новое знание в память (не падает даже без эмбеддингов)
     try:
-        text_for_memory = (
-            f"Куратор оценил ученика.\n"
-            f"Цели: {goals or '—'}.\n"
-            f"Ошибки: {', '.join(errs) if errs else '—'}.\n"
-            f"Уровень: {profile_data.get('level')}.\n"
-            f"Краткий совет: {profile_data.get('advice', '')[:200]}"
-        )
         save_memory(
             student_id,
-            text_for_memory,
+            (
+                "Куратор оценил ученика.\n"
+                f"Цели: {clean_goals or '—'}.\n"
+                f"Ошибки: {', '.join(clean_errors) if clean_errors else '—'}.\n"
+                f"Уровень: {profile_data.get('level')}.\n"
+                f"Совет: {str(profile_data.get('advice') or '')[:200]}"
+            ),
             {
                 "kind": "curator_assessment",
                 "level": profile_data.get("level"),
-                "goals": goals,
-                "errors": errs,
-                "profile": profile_data,  # полный JSON, если надо вытащить
+                "goals": clean_goals,
+                "errors": clean_errors,
+                "profile": profile_data,
             },
         )
-    except Exception as e:
-        print(f"[curator] save_memory failed: {e}")
+    except Exception:
+        pass
 
-    # 5) обновляем in-memory профиль для совместимости со старым фронтом /student
     try:
-        global _DB_STUDENT
-        _DB_STUDENT = StudentProfile(
+        legacy_api._DB_STUDENT = legacy_api.StudentProfile(
             name="",
-            goals=goals,
-            level=profile_data.get("level", lvl),
+            goals=clean_goals,
+            level=profile_data.get("level", normalized_level),
             notes=profile_data.get("notes", ""),
         )
-    except Exception as e:
-        print(f"[curator] legacy in-memory update failed: {e}")
+    except Exception:
+        pass
 
     return profile_data

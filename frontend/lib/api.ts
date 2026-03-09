@@ -76,6 +76,24 @@ export async function examinerGenerate(
     return r.json(); // { ok, questions, rubric }
 }
 
+export type AfterExamInput = {
+    student_id: string;
+    level: 'beginner' | 'intermediate' | 'advanced';
+    topic: string;
+    ok: number;
+    total: number;
+};
+
+export async function afterExam(input: AfterExamInput) {
+    const r = await fetch(`${API_BASE}/v1/agents/after_exam`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(input),
+    });
+    if (!r.ok) throw new Error(`after_exam failed: ${r.status}`);
+    return r.json();
+}
+
 export async function sessionLearn(input: {
     student_id: string;
     goals: string;

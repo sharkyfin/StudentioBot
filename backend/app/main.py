@@ -1,15 +1,20 @@
-# main.py
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.deps import settings
+
 from app.routers import legacy_api, agents
-from app.agents.materials_agent import init_materials_table  # ← добавь импорт
+from app.agents.materials_agent import init_materials_table
+from app.deps import settings
 
-# ---- Инициализация приложения ----
-app = FastAPI(title="Studentio Backend")
 
-# ---- Создаём таблицу при запуске ----
-init_materials_table()  # ← добавь эту строку
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    init_materials_table()
+    yield
+
+
+app = FastAPI(title="Studentio Backend", lifespan=lifespan)
 
 # ---- CORS ----
 app.add_middleware(
@@ -20,7 +25,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---- Подключение роутеров ----
 app.include_router(legacy_api.router)
 app.include_router(agents.router)
 
